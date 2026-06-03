@@ -1,0 +1,22 @@
+{
+  "version": "example-2026-06-03",
+  "metrics": {
+    "paid_revenue": "결제일 기준 결제 금액 합계"
+  },
+  "tables": [
+    {
+      "name": "v_orders_masked",
+      "description": "read-only bot account에 열린 주문 마스킹 뷰",
+      "time_column": "paid_at",
+      "default_window_days": 30,
+      "max_window_days": 90,
+      "columns": [
+        {"name": "order_id", "description": "주문 식별자", "data_type": "bigint"},
+        {"name": "customer_id", "description": "고객 식별자", "data_type": "bigint", "pii": true},
+        {"name": "paid_at", "description": "결제 시각", "data_type": "datetime"},
+        {"name": "amount", "description": "결제 금액", "data_type": "decimal"},
+        {"name": "status", "description": "주문 상태", "data_type": "varchar"}
+      ]
+    }
+  ]
+}
