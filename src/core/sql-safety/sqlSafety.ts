@@ -3,7 +3,7 @@ import sqlParser from "node-sql-parser";
 const { Parser } = sqlParser;
 
 import type { Catalog } from "../catalog/index.js";
-import { hasColumn, tableNames } from "../catalog/index.js";
+import { findTable, hasColumn, tableNames } from "../catalog/index.js";
 
 export type SafetyViolation = Readonly<{
   code:
@@ -30,7 +30,7 @@ export type SqlSafetyPolicy = Readonly<{
 
 export const defaultSqlSafetyPolicy: SqlSafetyPolicy = Object.freeze({
   maxLimit: 1000,
-  deniedFunctions: new Set(["benchmark", "sleep", "load_file", "into_outfile", "into_dumpfile", "get_lock"]),
+  deniedFunctions: new Set(["benchmark", "sleep", "load_file", "get_lock"]),
   deniedSchemas: new Set(["information_schema", "mysql", "performance_schema", "sys"]),
 });
 
@@ -87,8 +87,13 @@ export function createSqlSafetyGate(
       if (limit === undefined) {
         ast.limit = { seperator: "", value: [{ type: "number", value: policy.maxLimit }] };
       } else if (limit.value === undefined || limit.value > policy.maxLimit) {
-        const limitNode = ast.limit as SqlAst;
-        limitNode.value = [{ type: "number", value: policy.maxLimit }];
+        const cappedLimit = { type: "number", value: policy.maxLimit };
+        if (limit.countNode === undefined) {
+          const limitNode = ast.limit as SqlAst;
+          limitNode.value = [cappedLimit];
+        } else {
+          Object.assign(limit.countNode, cappedLimit);
+        }
       }
 
       return parser.sqlify(ast as never, parseOptions);
@@ -130,8 +135,8 @@ function validateTables(ast: SqlAst, catalog: Catalog, policy: SqlSafetyPolicy):
     if (table.db !== undefined && policy.deniedSchemas.has(table.db.toLowerCase())) {
       violations.push({ code: "denied_schema", message: `금지된 스키마입니다: ${table.db}` });
     }
-    if (!allowedTableNames.has(table.table)) {
-      violations.push({ code: "unknown_table", message: `카탈로그에 없는 테이블/뷰입니다: ${table.table}` });
+    if (!allowedTableNames.has(table.catalogName)) {
+      violations.push({ code: "unknown_table", message: `카탈로그에 없는 테이블/뷰입니다: ${table.catalogName}` });
     }
   }
 
@@ -149,6 +154,9 @@ function validateColumns(ast: SqlAst, catalog: Catalog): SafetyViolation[] {
     }
 
     const tableName = column.table === undefined ? undefined : aliases.get(column.table) ?? column.table;
+    if (tableName !== undefined && findTable(catalog, tableName) === undefined) {
+      continue;
+    }
     if (!hasColumn(catalog, column.column, tableName)) {
       violations.push({
         code: "unknown_column",
@@ -185,28 +193,34 @@ function hasSelectInto(ast: SqlAst): boolean {
   return into !== undefined && into.position !== null && into.position !== undefined;
 }
 
-function getLimit(ast: SqlAst): { value: number | undefined } | undefined {
+function getLimit(ast: SqlAst): { value: number | undefined; countNode: SqlAst | undefined } | undefined {
   const limit = ast.limit as SqlAst | null | undefined;
-  const values = limit?.value;
+  if (limit === null || limit === undefined) {
+    return undefined;
+  }
+
+  const values = limit.value;
   if (!Array.isArray(values) || values.length === 0) {
     return undefined;
   }
 
-  const lastValue = values[values.length - 1] as SqlAst;
-  if (lastValue.type !== "number") {
-    return { value: undefined };
+  const countIndex = limit.seperator === "offset" ? 0 : values.length - 1;
+  const countNode = values[countIndex] as SqlAst | undefined;
+  if (countNode === undefined || countNode.type !== "number") {
+    return { value: undefined, countNode };
   }
 
-  const value = typeof lastValue.value === "number" ? lastValue.value : Number(lastValue.value);
-  return Number.isInteger(value) ? { value } : { value: undefined };
+  const value = typeof countNode.value === "number" ? countNode.value : Number(countNode.value);
+  return Number.isInteger(value) ? { value, countNode } : { value: undefined, countNode };
 }
 
-function tableReferences(ast: SqlAst): Array<{ db?: string; table: string; as?: string }> {
+function tableReferences(ast: SqlAst): Array<{ db?: string; table: string; catalogName: string; as?: string }> {
   return collectObjects(ast)
     .filter((node) => typeof node.table === "string" && (node.db === null || typeof node.db === "string"))
     .map((node) => ({
       ...(typeof node.db === "string" ? { db: node.db } : {}),
       table: node.table as string,
+      catalogName: typeof node.db === "string" ? `${node.db}.${node.table as string}` : (node.table as string),
       ...(typeof node.as === "string" ? { as: node.as } : {}),
     }));
 }
@@ -214,9 +228,10 @@ function tableReferences(ast: SqlAst): Array<{ db?: string; table: string; as?: 
 function tableAliasMap(ast: SqlAst): ReadonlyMap<string, string> {
   const aliases = new Map<string, string>();
   for (const table of tableReferences(ast)) {
-    aliases.set(table.table, table.table);
+    aliases.set(table.table, table.catalogName);
+    aliases.set(table.catalogName, table.catalogName);
     if (table.as !== undefined) {
-      aliases.set(table.as, table.table);
+      aliases.set(table.as, table.catalogName);
     }
   }
   return aliases;
